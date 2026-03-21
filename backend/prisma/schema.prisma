@@ -1,0 +1,51 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Category {
+  id           Int           @id @default(autoincrement())
+  name         String        @unique @db.VarChar(100)
+  slug         String        @unique @db.VarChar(100)
+  createdAt    DateTime      @default(now()) @map("created_at")
+  transactions Transaction[]
+
+  @@map("categories")
+}
+
+model Transaction {
+  id           Int       @id @default(autoincrement())
+  date         DateTime  @db.Date
+  description  String?   @db.Text
+  amountCents  Int       @map("amount_cents")
+  categoryId   Int?      @map("category_id")
+  category     Category? @relation(fields: [categoryId], references: [id])
+  anomalyFlags String[]  @default([]) @map("anomaly_flags")
+  needsReview  Boolean   @default(false) @map("needs_review")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  @@index([date])
+  @@index([categoryId])
+  @@index([needsReview])
+  @@index([date, amountCents])
+  @@map("transactions")
+}
+
+model Rule {
+  id             Int      @id @default(autoincrement())
+  name           String   @db.VarChar(255)
+  conditionType  String   @map("condition_type") @db.VarChar(50)
+  conditionValue String   @map("condition_value") @db.Text
+  actionType     String   @map("action_type") @db.VarChar(50)
+  actionValue    String   @map("action_value") @db.Text
+  priority       Int      @default(0)
+  active         Boolean  @default(true)
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  @@map("rules")
+}
