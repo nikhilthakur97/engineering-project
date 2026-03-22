@@ -14,11 +14,13 @@ import AnomalyBadge from "../components/AnomalyBadge";
 import TransactionForm from "../components/TransactionForm";
 import SpendingChart from "../components/SpendingChart";
 import { useState, useMemo } from "react";
+import { useNavigate } from "react-router-dom";
 
 type Tab = "uncategorized" | "flagged";
 
 export default function Dashboard() {
   const qc = useQueryClient();
+  const navigate = useNavigate();
   const [tab, setTab] = useState<Tab>("uncategorized");
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [editingId, setEditingId] = useState<number | null>(null);
@@ -44,7 +46,7 @@ export default function Dashboard() {
     () =>
       tab === "uncategorized"
         ? { categoryId: "null", limit: 100 }
-        : { needsReview: "true", limit: 100 },
+        : { flagged: "true", limit: 100 },
     [tab]
   );
 
@@ -119,26 +121,44 @@ export default function Dashboard() {
       {/* Summary cards */}
       <div className="grid grid-cols-4 gap-4 mb-6">
         {[
-          { label: "Total", value: summary?.total ?? "—", color: "text-gray-900" },
+          { label: "Total", value: summary?.total ?? "—", color: "text-gray-900", tab: null, link: null },
           {
             label: "Uncategorized",
             value: summary?.uncategorized ?? "—",
             color: "text-yellow-700",
+            tab: "uncategorized" as Tab,
+            link: null,
           },
           {
             label: "Flagged",
             value: summary?.flagged ?? "—",
             color: "text-red-700",
+            tab: "flagged" as Tab,
+            link: null,
           },
           {
             label: "Needs Review",
             value: summary?.needsReview ?? "—",
             color: "text-indigo-700",
+            tab: null,
+            link: "/transactions?needsReview=true",
           },
         ].map((card) => (
           <div
             key={card.label}
-            className="bg-white rounded-xl border border-gray-200 p-4"
+            onClick={() => {
+              if (card.link) {
+                navigate(card.link);
+              } else if (card.tab) {
+                setTab(card.tab);
+                setSelected(new Set());
+              }
+            }}
+            className={`bg-white rounded-xl border border-gray-200 p-4 transition-colors ${
+              card.tab || card.link
+                ? "cursor-pointer hover:border-indigo-300 hover:shadow-sm"
+                : ""
+            } ${card.tab && card.tab === tab ? "border-indigo-400 ring-1 ring-indigo-100" : ""}`}
           >
             <p className="text-xs text-gray-500 uppercase tracking-wide">
               {card.label}
