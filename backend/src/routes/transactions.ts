@@ -32,6 +32,7 @@ router.get("/", async (req, res, next) => {
       : undefined;
     const search = req.query.search as string | undefined;
     const anomalyFlag = req.query.anomalyFlag as string | undefined;
+    const flagged = req.query.flagged === "true";
 
     const where: any = {};
     if (categoryId !== undefined) where.categoryId = categoryId;
@@ -48,6 +49,9 @@ router.get("/", async (req, res, next) => {
     }
     if (anomalyFlag) {
       where.anomalyFlags = { has: anomalyFlag };
+    }
+    if (flagged) {
+      where.anomalyFlags = { isEmpty: false };
     }
 
     const transactions = await prisma.transaction.findMany({
