@@ -16,15 +16,67 @@ interface RawRow {
   description?: string;
   amount?: string;
   category?: string;
+  deposits?: string;
+  withdrawals?: string;
+  balance?: string;
 }
 
 const BATCH_SIZE = 500;
+
+export interface ImportProgress {
+  phase: string;
+  totalRows: number;
+  processedRows: number;
+  imported: number;
+  skipped: number;
+  failed: number;
+}
+
+let currentProgress: ImportProgress | null = null;
+
+export function getImportProgress(): ImportProgress | null {
+  return currentProgress;
+}
 
 export async function importCsv(
   prisma: PrismaClient,
   buffer: Buffer
 ): Promise<ImportResult> {
-  const rows = await parseCsv(buffer);
+  const { rows, resolvedHeaders, originalHeaders } = await parseCsv(buffer);
+
+  const hasDate = resolvedHeaders.includes("date");
+  const hasAmount = resolvedHeaders.includes("amount");
+  const hasDepositsOrWithdrawals =
+    resolvedHeaders.includes("deposits") || resolvedHeaders.includes("withdrawals");
+
+  if (!hasDate || (!hasAmount && !hasDepositsOrWithdrawals)) {
+    const missing: string[] = [];
+    if (!hasDate) missing.push("date");
+    if (!hasAmount && !hasDepositsOrWithdrawals) missing.push("amount (or deposits/withdrawals)");
+    return {
+      imported: 0,
+      skipped: 0,
+      failed: rows.length,
+      errors: [
+        {
+          row: 1,
+          message: `Missing required columns: ${missing.join(", ")}. `
+            + `Your file has: [${originalHeaders.join(", ")}]. `
+            + `Expected at least: date, amount (or deposits/withdrawals). `
+            + `Optional: description, category.`,
+        },
+      ],
+    };
+  }
+
+  currentProgress = {
+    phase: "validating",
+    totalRows: rows.length,
+    processedRows: 0,
+    imported: 0,
+    skipped: 0,
+    failed: 0,
+  };
   const categories = await prisma.category.findMany();
   const categoryMap = new Map(categories.map((c) => [c.slug, c.id]));
   const categoryNameMap = new Map(
@@ -54,9 +106,12 @@ export async function importCsv(
     const rowNum = i + 2; // +2 because row 1 is the header
     const raw = rows[i];
 
+    currentProgress!.processedRows = i + 1;
+
     const validation = validateRow(raw, rowNum);
     if (validation.error) {
       result.failed++;
+      currentProgress!.failed++;
       result.errors.push({ row: rowNum, message: validation.error });
       continue;
     }
@@ -74,13 +129,14 @@ export async function importCsv(
     }
 
     // Check for duplicates within the file itself (Set-based O(1) lookup)
-    const dedupeKey = `${date.getTime()}|${amountCents}|${normalize(description)}`;
+    const dedupeKey = `${dateKey(date)}|${amountCents}|${normalize(description)}`;
     if (seenInFile.has(dedupeKey)) {
       result.skipped++;
       result.errors.push({ row: rowNum, message: "Duplicate within file" });
       continue;
     }
     seenInFile.add(dedupeKey);
+    currentProgress!.skipped = result.skipped;
 
     // Run rules engine for auto-categorization and flagging
     const ruleResult = await evaluateRules(
@@ -103,19 +159,24 @@ export async function importCsv(
   }
 
   // Check for duplicates against existing database records
+  currentProgress!.phase = "deduplicating";
   const deduped = await deduplicateAgainstDb(prisma, validRows);
   result.skipped += validRows.length - deduped.length;
+  currentProgress!.skipped = result.skipped;
 
   // Batch insert and collect IDs for anomaly detection
+  currentProgress!.phase = "inserting";
   const insertedIds: number[] = [];
   for (let i = 0; i < deduped.length; i += BATCH_SIZE) {
     const batch = deduped.slice(i, i + BATCH_SIZE);
     const created = await prisma.transaction.createMany({ data: batch });
     result.imported += created.count;
+    currentProgress!.imported = result.imported;
   }
 
   // Fetch IDs of newly inserted transactions for anomaly detection
   if (result.imported > 0) {
+    currentProgress!.phase = "detecting_anomalies";
     const recent = await prisma.transaction.findMany({
       orderBy: { id: "desc" },
       take: result.imported,
@@ -127,6 +188,9 @@ export async function importCsv(
     await detectAnomaliesBatch(prisma, insertedIds);
   }
 
+  currentProgress!.phase = "complete";
+  const finalProgress = currentProgress;
+  currentProgress = null;
   return result;
 }
 
@@ -143,50 +207,109 @@ async function deduplicateAgainstDb(
 ): Promise<typeof rows> {
   if (rows.length === 0) return [];
 
-  // Get unique date+amount pairs to query
-  const dateAmountPairs = [
-    ...new Set(rows.map((r) => `${r.date.toISOString()}|${r.amountCents}`)),
-  ];
+  const existingSet = new Set<string>();
+  const CHUNK_SIZE = 500;
 
-  const dates = dateAmountPairs.map((p) => new Date(p.split("|")[0]));
-  const amounts = dateAmountPairs.map((p) => Number(p.split("|")[1]));
+  // Query in batches to avoid exceeding PostgreSQL parameter limits
+  for (let i = 0; i < rows.length; i += CHUNK_SIZE) {
+    const chunk = rows.slice(i, i + CHUNK_SIZE);
+    const dates = [...new Set(chunk.map((r) => r.date.toISOString()))].map(
+      (d) => new Date(d)
+    );
+    const amounts = [...new Set(chunk.map((r) => r.amountCents))];
 
-  const existing = await prisma.transaction.findMany({
-    where: {
-      date: { in: dates },
-      amountCents: { in: amounts },
-    },
-    select: { date: true, amountCents: true, description: true },
-  });
+    const existing = await prisma.transaction.findMany({
+      where: {
+        date: { in: dates },
+        amountCents: { in: amounts },
+      },
+      select: { date: true, amountCents: true, description: true },
+    });
 
-  const existingSet = new Set(
-    existing.map(
-      (e) =>
-        `${new Date(e.date).toISOString()}|${e.amountCents}|${normalize(e.description)}`
-    )
-  );
+    for (const e of existing) {
+      existingSet.add(
+        `${dateKey(new Date(e.date))}|${e.amountCents}|${normalize(e.description)}`
+      );
+    }
+  }
 
   return rows.filter((r) => {
-    const key = `${r.date.toISOString()}|${r.amountCents}|${normalize(r.description)}`;
+    const key = `${dateKey(r.date)}|${r.amountCents}|${normalize(r.description)}`;
     return !existingSet.has(key);
   });
 }
 
-function parseCsv(buffer: Buffer): Promise<RawRow[]> {
+const COLUMN_ALIASES: Record<string, string> = {
+  date: "date",
+  transaction_date: "date",
+  trans_date: "date",
+  timestamp: "date",
+  posted_date: "date",
+
+  description: "description",
+  desc: "description",
+  payee: "description",
+  memo: "description",
+  narration: "description",
+  details: "description",
+  transaction_description: "description",
+
+  amount: "amount",
+  transaction_amount: "amount",
+  transactionamount: "amount",
+  value: "amount",
+  sum: "amount",
+
+  deposits: "deposits",
+  deposit: "deposits",
+  credit: "deposits",
+  credits: "deposits",
+
+  withdrawals: "withdrawals",
+  withdrawls: "withdrawals",
+  withdrawal: "withdrawals",
+  debit: "withdrawals",
+  debits: "withdrawals",
+
+  balance: "balance",
+
+  category: "category",
+  category_name: "category",
+  type: "category",
+  transaction_type: "category",
+  transactiontype: "category",
+};
+
+interface ParseResult {
+  rows: RawRow[];
+  resolvedHeaders: string[];
+  originalHeaders: string[];
+}
+
+function parseCsv(buffer: Buffer): Promise<ParseResult> {
   return new Promise((resolve, reject) => {
     const rows: RawRow[] = [];
+    let resolvedHeaders: string[] = [];
+    let originalHeaders: string[] = [];
     const stream = Readable.from(buffer);
     stream
       .pipe(
         parse({
-          columns: true,
+          columns: (headers: string[]) => {
+            originalHeaders = headers.map((h) => h.replace(/^\uFEFF/, "").trim());
+            resolvedHeaders = originalHeaders.map((h) => {
+              const key = h.toLowerCase().replace(/[\s-]+/g, "_");
+              return COLUMN_ALIASES[key] || key;
+            });
+            return resolvedHeaders;
+          },
           skip_empty_lines: true,
           trim: true,
           relax_column_count: true,
         })
       )
       .on("data", (row: RawRow) => rows.push(row))
-      .on("end", () => resolve(rows))
+      .on("end", () => resolve({ rows, resolvedHeaders, originalHeaders }))
       .on("error", reject);
   });
 }
@@ -201,6 +324,18 @@ function validateRow(
   const parsed = new Date(raw.date.trim());
   if (isNaN(parsed.getTime())) {
     return { error: `Invalid date: "${raw.date}"` };
+  }
+
+  // Derive amount from deposits/withdrawals columns if no amount column
+  if ((!raw.amount || !raw.amount.trim()) && (raw.deposits || raw.withdrawals)) {
+    const depStr = (raw.deposits || "0").trim().replace(/[$,]/g, "");
+    const wthStr = (raw.withdrawals || "0").trim().replace(/[$,]/g, "");
+    const dep = Number(depStr);
+    const wth = Number(wthStr);
+    if (isNaN(dep) || isNaN(wth)) {
+      return { error: `Invalid deposit/withdrawal value` };
+    }
+    raw.amount = String(dep - wth);
   }
 
   if (!raw.amount || !raw.amount.trim()) {
@@ -219,4 +354,12 @@ function validateRow(
 
 function normalize(s: string | null | undefined): string {
   return (s || "").trim().toLowerCase();
+}
+
+/** Calendar date in the environment's local timezone (avoids UTC day shifts from toISOString). */
+function dateKey(d: Date): string {
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }

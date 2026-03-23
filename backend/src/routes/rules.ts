@@ -38,6 +38,9 @@ router.post("/", async (req, res, next) => {
       return;
     }
 
+    const parsedPriority =
+      priority !== undefined && priority !== null ? Number(priority) : 0;
+
     const rule = await prisma.rule.create({
       data: {
         name: name.trim(),
@@ -45,7 +48,7 @@ router.post("/", async (req, res, next) => {
         conditionValue: String(conditionValue).trim(),
         actionType,
         actionValue: String(actionValue).trim(),
-        priority: priority ?? 0,
+        priority: parsedPriority,
       },
     });
     res.status(201).json(rule);
@@ -92,7 +95,11 @@ router.put("/:id", async (req, res, next) => {
     }
     if (actionValue !== undefined)
       updateData.actionValue = String(actionValue).trim();
-    if (priority !== undefined) updateData.priority = Number(priority);
+    if (priority !== undefined) {
+      const p = Number(priority);
+      if (isNaN(p)) { res.status(400).json({ error: "priority must be a number" }); return; }
+      updateData.priority = p;
+    }
     if (active !== undefined) updateData.active = Boolean(active);
 
     const rule = await prisma.rule.update({ where: { id }, data: updateData });
@@ -144,6 +151,10 @@ function validateRule(body: any): string | undefined {
     return `Invalid actionType. Must be one of: ${VALID_ACTION_TYPES.join(", ")}`;
   if (!body.actionValue && body.actionValue !== 0)
     return "actionValue is required";
+  if (body.priority !== undefined && body.priority !== null) {
+    const p = Number(body.priority);
+    if (isNaN(p)) return "priority must be a number";
+  }
   return undefined;
 }
 

@@ -27,6 +27,7 @@ router.get("/spending", async (req, res, next) => {
   try {
     const months = Math.max(1, Math.min(Number(req.query.months) || 12, 24));
     const cutoff = new Date();
+    cutoff.setDate(1);
     cutoff.setMonth(cutoff.getMonth() - months);
 
     const rows = await prisma.$queryRaw<

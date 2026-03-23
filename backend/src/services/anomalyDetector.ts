@@ -31,114 +31,139 @@ export async function detectAnomalies(
 
 /**
  * Run anomaly detection on a batch of transaction IDs (already in DB).
- * Pre-loads duplicate candidates and amount stats in bulk to avoid
- * 3×N individual DB queries.
+ * Processes in chunks, uses Map-based O(1) duplicate lookup, and
+ * groups UPDATEs by flag combination for bulk execution.
  */
 export async function detectAnomaliesBatch(
   prisma: PrismaClient,
   transactionIds?: number[]
 ): Promise<{ flagged: number }> {
-  const where = transactionIds ? { id: { in: transactionIds } } : {};
-  const transactions = await prisma.transaction.findMany({
-    where,
-    select: {
-      id: true,
-      date: true,
-      description: true,
-      amountCents: true,
-      categoryId: true,
-      anomalyFlags: true,
-    },
+  const CHUNK = 5000;
+  let totalFlagged = 0;
+
+  const allIds = transactionIds ?? (
+    await prisma.transaction.findMany({ select: { id: true }, orderBy: { id: "asc" } })
+  ).map((t) => t.id);
+
+  const categoryIds = new Set<number>();
+  const allCatRows = await prisma.transaction.findMany({
+    where: transactionIds ? { id: { in: transactionIds } } : {},
+    select: { categoryId: true },
+    distinct: ["categoryId"],
   });
+  for (const r of allCatRows) {
+    if (r.categoryId !== null) categoryIds.add(r.categoryId);
+  }
+  const statsMap = await precomputeAmountStats(prisma, [...categoryIds]);
 
-  if (transactions.length === 0) return { flagged: 0 };
+  for (let offset = 0; offset < allIds.length; offset += CHUNK) {
+    const chunkIds = allIds.slice(offset, offset + CHUNK);
+    const transactions = await prisma.transaction.findMany({
+      where: { id: { in: chunkIds } },
+      select: {
+        id: true,
+        date: true,
+        description: true,
+        amountCents: true,
+        categoryId: true,
+        anomalyFlags: true,
+      },
+    });
 
-  // Pre-load duplicate candidates in a single query
-  const uniqueDates = [
-    ...new Set(transactions.map((t) => new Date(t.date).toISOString())),
-  ].map((d) => new Date(d));
-  const uniqueAmounts = [...new Set(transactions.map((t) => t.amountCents))];
+    if (transactions.length === 0) continue;
 
-  const duplicateCandidates = await prisma.transaction.findMany({
-    where: {
-      date: { in: uniqueDates },
-      amountCents: { in: uniqueAmounts },
-    },
-    select: { id: true, date: true, amountCents: true, description: true },
-  });
+    // Pre-load duplicate candidates and index by date|amount for O(1) lookup
+    const uniqueDates = [
+      ...new Set(transactions.map((t) => new Date(t.date).toISOString())),
+    ].map((d) => new Date(d));
+    const uniqueAmounts = [...new Set(transactions.map((t) => t.amountCents))];
 
-  // Pre-compute amount stats per category (+ global for uncategorized)
-  const categoryIds = [
-    ...new Set(
-      transactions
-        .map((t) => t.categoryId)
-        .filter((id): id is number => id !== null)
-    ),
-  ];
-  const statsMap = await precomputeAmountStats(prisma, categoryIds);
+    const duplicateCandidates = await prisma.transaction.findMany({
+      where: {
+        date: { in: uniqueDates },
+        amountCents: { in: uniqueAmounts },
+      },
+      select: { id: true, date: true, amountCents: true, description: true },
+    });
 
-  let flagged = 0;
-
-  for (const tx of transactions) {
-    const flags: string[] = [];
-
-    // Check 1: Missing metadata
-    if (!tx.description || tx.description.trim().length === 0) {
-      flags.push("incomplete");
+    const dupeMap = new Map<string, { id: number; description: string | null }[]>();
+    for (const c of duplicateCandidates) {
+      const key = `${new Date(c.date).toISOString()}|${c.amountCents}`;
+      let bucket = dupeMap.get(key);
+      if (!bucket) { bucket = []; dupeMap.set(key, bucket); }
+      bucket.push({ id: c.id, description: c.description });
     }
 
-    // Check 2: Duplicate (using preloaded candidates)
-    const txDateISO = new Date(tx.date).toISOString();
-    const normalizedDesc = normalize(tx.description);
-    const matches = duplicateCandidates.filter(
-      (c) =>
-        c.id !== tx.id &&
-        new Date(c.date).toISOString() === txDateISO &&
-        c.amountCents === tx.amountCents
-    );
-    if (
-      matches.some((m) => {
-        const matchDesc = normalize(m.description);
-        if (matchDesc === normalizedDesc) return true;
-        if (matchDesc.length > 3 && normalizedDesc.length > 3) {
-          return (
-            matchDesc.includes(normalizedDesc) ||
-            normalizedDesc.includes(matchDesc)
-          );
-        }
-        return false;
-      })
-    ) {
-      flags.push("possible_duplicate");
+    // Group updates by (sorted flags + needsReview) for bulk SQL UPDATEs
+    const grouped = new Map<string, number[]>();
+
+    for (const tx of transactions) {
+      const flags: string[] = [];
+
+      if (!tx.description || tx.description.trim().length === 0) {
+        flags.push("incomplete");
+      }
+
+      const txDateISO = new Date(tx.date).toISOString();
+      const normalizedDesc = normalize(tx.description);
+      const key = `${txDateISO}|${tx.amountCents}`;
+      const bucket = dupeMap.get(key);
+      if (bucket) {
+        const isDupe = bucket.some((m) => {
+          if (m.id === tx.id) return false;
+          const matchDesc = normalize(m.description);
+          if (matchDesc === normalizedDesc) return true;
+          if (matchDesc.length > 3 && normalizedDesc.length > 3) {
+            return matchDesc.includes(normalizedDesc) || normalizedDesc.includes(matchDesc);
+          }
+          return false;
+        });
+        if (isDupe) flags.push("possible_duplicate");
+      }
+
+      const stats = statsMap.get(tx.categoryId ?? -1) ?? statsMap.get(-1);
+      if (stats && stats.count >= 10 && stats.stddev > 0) {
+        const zScore = Math.abs(tx.amountCents - stats.mean) / stats.stddev;
+        if (zScore > 3) flags.push("unusual_amount");
+      }
+
+      const existingNonAnomaly = (tx.anomalyFlags || []).filter(
+        (f) => !["incomplete", "possible_duplicate", "unusual_amount"].includes(f)
+      );
+      const mergedFlags = [...new Set([...existingNonAnomaly, ...flags])];
+      const needsReview = mergedFlags.length > 0 || tx.categoryId === null;
+
+      const changed =
+        mergedFlags.length !== (tx.anomalyFlags || []).length ||
+        mergedFlags.some((f) => !(tx.anomalyFlags || []).includes(f));
+
+      if (changed) {
+        const sortedFlags = [...mergedFlags].sort();
+        const groupKey = JSON.stringify({ flags: sortedFlags, needsReview });
+        let ids = grouped.get(groupKey);
+        if (!ids) { ids = []; grouped.set(groupKey, ids); }
+        ids.push(tx.id);
+        if (flags.length > 0) totalFlagged++;
+      }
     }
 
-    // Check 3: Unusual amount (using precomputed stats)
-    const stats = statsMap.get(tx.categoryId ?? -1) ?? statsMap.get(-1);
-    if (stats && stats.count >= 10 && stats.stddev > 0) {
-      const zScore = Math.abs(tx.amountCents - stats.mean) / stats.stddev;
-      if (zScore > 3) flags.push("unusual_amount");
-    }
+    // Execute one UPDATE per unique flag combination (typically just a few)
+    for (const [groupKey, ids] of grouped) {
+      const { flags: flagsArr, needsReview } = JSON.parse(groupKey) as { flags: string[]; needsReview: boolean };
 
-    // Merge new anomaly flags with existing rule-based flags
-    const existingNonAnomaly = (tx.anomalyFlags || []).filter(
-      (f) => !["incomplete", "possible_duplicate", "unusual_amount"].includes(f)
-    );
-    const mergedFlags = [...new Set([...existingNonAnomaly, ...flags])];
-    const needsReview = mergedFlags.length > 0 || tx.categoryId === null;
-
-    if (
-      mergedFlags.length !== (tx.anomalyFlags || []).length ||
-      mergedFlags.some((f) => !(tx.anomalyFlags || []).includes(f))
-    ) {
-      await prisma.transaction.update({
-        where: { id: tx.id },
-        data: { anomalyFlags: mergedFlags, needsReview },
-      });
-      if (flags.length > 0) flagged++;
+      for (let i = 0; i < ids.length; i += 1000) {
+        const chunk = ids.slice(i, i + 1000);
+        await prisma.$executeRaw`
+          UPDATE transactions
+          SET anomaly_flags = ${flagsArr}::text[],
+              needs_review = ${needsReview}
+          WHERE id = ANY(${chunk}::int[])
+        `;
+      }
     }
   }
 
-  return { flagged };
+  return { flagged: totalFlagged };
 }
 
 // ---------------------------------------------------------------------------

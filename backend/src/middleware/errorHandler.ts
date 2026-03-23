@@ -8,6 +8,6 @@ export function errorHandler(
 ) {
   console.error(err.stack);
   res.status(500).json({
-    error: err.message || "Internal server error",
+    error: "Internal server error",
   });
 }

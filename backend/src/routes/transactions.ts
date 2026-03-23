@@ -1,7 +1,7 @@
 import { Router } from "express";
 import multer from "multer";
 import { prisma } from "../index";
-import { importCsv } from "../services/csvImporter";
+import { importCsv, getImportProgress } from "../services/csvImporter";
 import { evaluateRules, applyRulesToExisting } from "../services/ruleEngine";
 import { detectAnomalies } from "../services/anomalyDetector";
 
@@ -15,9 +15,19 @@ router.get("/", async (req, res, next) => {
   try {
     const limit = Math.min(Number(req.query.limit) || 50, 200);
     const cursor = req.query.cursor ? Number(req.query.cursor) : undefined;
-    const categoryId = req.query.categoryId
-      ? Number(req.query.categoryId)
-      : undefined;
+    if (cursor !== undefined && isNaN(cursor)) {
+      res.status(400).json({ error: "Invalid cursor" });
+      return;
+    }
+    const categoryId = req.query.categoryId === "null"
+      ? undefined
+      : req.query.categoryId
+        ? Number(req.query.categoryId)
+        : undefined;
+    if (categoryId !== undefined && isNaN(categoryId)) {
+      res.status(400).json({ error: "Invalid categoryId" });
+      return;
+    }
     const needsReview =
       req.query.needsReview === "true"
         ? true
@@ -35,9 +45,11 @@ router.get("/", async (req, res, next) => {
     const flagged = req.query.flagged === "true";
 
     const where: any = {};
-    if (categoryId !== undefined) where.categoryId = categoryId;
-    if (categoryId === 0) where.categoryId = null; // uncategorized
-    if (req.query.categoryId === "null") where.categoryId = null;
+    if (req.query.categoryId === "null") {
+      where.categoryId = null;
+    } else if (categoryId !== undefined) {
+      where.categoryId = categoryId;
+    }
     if (needsReview !== undefined) where.needsReview = needsReview;
     if (dateFrom || dateTo) {
       where.date = {};
@@ -77,6 +89,14 @@ router.get("/", async (req, res, next) => {
   } catch (err) {
     next(err);
   }
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/transactions/import/progress — poll import progress
+// ---------------------------------------------------------------------------
+router.get("/import/progress", (_req, res) => {
+  const progress = getImportProgress();
+  res.json(progress || { phase: "idle", totalRows: 0, processedRows: 0, imported: 0, skipped: 0, failed: 0 });
 });
 
 // ---------------------------------------------------------------------------
