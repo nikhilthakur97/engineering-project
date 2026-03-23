@@ -95,10 +95,26 @@ export async function bulkAction(body: {
   return data;
 }
 
+export interface ImportProgress {
+  phase: string;
+  totalRows: number;
+  processedRows: number;
+  imported: number;
+  skipped: number;
+  failed: number;
+}
+
+export async function fetchImportProgress(): Promise<ImportProgress> {
+  const { data } = await api.get("/transactions/import/progress");
+  return data;
+}
+
 export async function importCsv(file: File): Promise<ImportResult> {
   const form = new FormData();
   form.append("file", file);
-  const { data } = await api.post("/transactions/import", form);
+  const { data } = await api.post("/transactions/import", form, {
+    timeout: 600_000,
+  });
   return data;
 }
 

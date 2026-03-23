@@ -14,13 +14,11 @@ import AnomalyBadge from "../components/AnomalyBadge";
 import TransactionForm from "../components/TransactionForm";
 import SpendingChart from "../components/SpendingChart";
 import { useState, useMemo } from "react";
-import { useNavigate } from "react-router-dom";
 
-type Tab = "uncategorized" | "flagged";
+type Tab = "uncategorized" | "flagged" | "needsReview";
 
 export default function Dashboard() {
   const qc = useQueryClient();
-  const navigate = useNavigate();
   const [tab, setTab] = useState<Tab>("uncategorized");
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [editingId, setEditingId] = useState<number | null>(null);
@@ -42,13 +40,16 @@ export default function Dashboard() {
     queryFn: () => fetchSpending(24),
   });
 
-  const params = useMemo(
-    () =>
-      tab === "uncategorized"
-        ? { categoryId: "null", limit: 100 }
-        : { flagged: "true", limit: 100 },
-    [tab]
-  );
+  const params = useMemo(() => {
+    switch (tab) {
+      case "uncategorized":
+        return { categoryId: "null", limit: 100 };
+      case "flagged":
+        return { flagged: "true", limit: 100 };
+      case "needsReview":
+        return { needsReview: "true", limit: 100 };
+    }
+  }, [tab]);
 
   const { data: txResponse } = useQuery({
     queryKey: ["review", tab],
@@ -121,41 +122,21 @@ export default function Dashboard() {
       {/* Summary cards */}
       <div className="grid grid-cols-4 gap-4 mb-6">
         {[
-          { label: "Total", value: summary?.total ?? "—", color: "text-gray-900", tab: null, link: null },
-          {
-            label: "Uncategorized",
-            value: summary?.uncategorized ?? "—",
-            color: "text-yellow-700",
-            tab: "uncategorized" as Tab,
-            link: null,
-          },
-          {
-            label: "Flagged",
-            value: summary?.flagged ?? "—",
-            color: "text-red-700",
-            tab: "flagged" as Tab,
-            link: null,
-          },
-          {
-            label: "Needs Review",
-            value: summary?.needsReview ?? "—",
-            color: "text-indigo-700",
-            tab: null,
-            link: "/transactions?needsReview=true",
-          },
+          { label: "Total", value: summary?.total ?? "—", color: "text-gray-900", tab: null },
+          { label: "Uncategorized", value: summary?.uncategorized ?? "—", color: "text-yellow-700", tab: "uncategorized" as Tab },
+          { label: "Flagged", value: summary?.flagged ?? "—", color: "text-red-700", tab: "flagged" as Tab },
+          { label: "Needs Review", value: summary?.needsReview ?? "—", color: "text-indigo-700", tab: "needsReview" as Tab },
         ].map((card) => (
           <div
             key={card.label}
             onClick={() => {
-              if (card.link) {
-                navigate(card.link);
-              } else if (card.tab) {
+              if (card.tab) {
                 setTab(card.tab);
                 setSelected(new Set());
               }
             }}
             className={`bg-white rounded-xl border border-gray-200 p-4 transition-colors ${
-              card.tab || card.link
+              card.tab
                 ? "cursor-pointer hover:border-indigo-300 hover:shadow-sm"
                 : ""
             } ${card.tab && card.tab === tab ? "border-indigo-400 ring-1 ring-indigo-100" : ""}`}
@@ -182,20 +163,24 @@ export default function Dashboard() {
 
       {/* Tabs */}
       <div className="flex gap-1 bg-gray-100 rounded-lg p-1 w-fit mb-4">
-        {(["uncategorized", "flagged"] as Tab[]).map((t) => (
+        {([
+          { key: "uncategorized" as Tab, label: "Uncategorized" },
+          { key: "flagged" as Tab, label: "Flagged Anomalies" },
+          { key: "needsReview" as Tab, label: "Needs Review" },
+        ]).map((t) => (
           <button
-            key={t}
+            key={t.key}
             onClick={() => {
-              setTab(t);
+              setTab(t.key);
               setSelected(new Set());
             }}
             className={`px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${
-              tab === t
+              tab === t.key
                 ? "bg-white text-gray-900 shadow-sm"
                 : "text-gray-500 hover:text-gray-700"
             }`}
           >
-            {t === "uncategorized" ? "Uncategorized" : "Flagged Anomalies"}
+            {t.label}
           </button>
         ))}
       </div>
@@ -206,7 +191,7 @@ export default function Dashboard() {
           <span className="text-sm font-medium text-indigo-700">
             {selected.size} selected
           </span>
-          {tab === "uncategorized" && (
+          {(tab === "uncategorized" || tab === "needsReview") && (
             <>
               <select
                 value={bulkCategoryId}
@@ -285,7 +270,9 @@ export default function Dashboard() {
                 <td colSpan={7} className="px-4 py-8 text-center text-gray-400">
                   {tab === "uncategorized"
                     ? "All transactions are categorized!"
-                    : "No flagged anomalies — everything looks good."}
+                    : tab === "flagged"
+                      ? "No flagged anomalies — everything looks good."
+                      : "Nothing needs review — all clear!"}
                 </td>
               </tr>
             ) : (

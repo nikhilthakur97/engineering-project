@@ -1,5 +1,6 @@
 import { useState, useEffect, useMemo, useCallback } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useSearchParams } from "react-router-dom";
 import {
   fetchTransactions,
   fetchCategories,
@@ -7,7 +8,6 @@ import {
   updateTransaction,
   deleteTransaction,
   bulkAction,
-  type Transaction,
   type Category,
 } from "../lib/api";
 import AnomalyBadge from "../components/AnomalyBadge";
@@ -25,6 +25,7 @@ function useDebounce<T>(value: T, delay: number): T {
 
 export default function Transactions() {
   const qc = useQueryClient();
+  const [searchParams] = useSearchParams();
   const [cursor, setCursor] = useState<number | undefined>();
   const [showAdd, setShowAdd] = useState(false);
   const [showImport, setShowImport] = useState(false);
@@ -34,7 +35,27 @@ export default function Transactions() {
 
   const [searchInput, setSearchInput] = useState("");
   const debouncedSearch = useDebounce(searchInput, 300);
-  const [filters, setFilters] = useState<Record<string, string>>({});
+  const [filters, setFilters] = useState<Record<string, string>>(() => {
+    const initial: Record<string, string> = {};
+    const nr = searchParams.get("needsReview");
+    if (nr) initial.needsReview = nr;
+    return initial;
+  });
+
+  const needsReviewFromUrl = searchParams.get("needsReview");
+  useEffect(() => {
+    const nr = needsReviewFromUrl && needsReviewFromUrl !== "" ? needsReviewFromUrl : null;
+    setFilters((f) => {
+      if (nr !== null && f.needsReview !== nr) {
+        return { ...f, needsReview: nr };
+      }
+      if (nr === null && f.needsReview !== undefined) {
+        const { needsReview, ...rest } = f;
+        return rest;
+      }
+      return f;
+    });
+  }, [needsReviewFromUrl]);
 
   const updateFilter = useCallback((key: string, value: string | undefined) => {
     setFilters((f) => {
@@ -52,9 +73,10 @@ export default function Transactions() {
     return params;
   }, [filters, debouncedSearch]);
 
-  // Reset to first page whenever filters or search change
+  // Reset to first page and clear selections whenever filters or search change
   useEffect(() => {
     setCursor(undefined);
+    setSelected(new Set());
   }, [queryParams]);
 
   const { data: categories = [] } = useQuery<Category[]>({
@@ -160,8 +182,9 @@ export default function Transactions() {
           </h3>
           <CsvUpload
             onComplete={() => {
-              qc.invalidateQueries({ queryKey: ["transactions"] });
+              qc.refetchQueries({ queryKey: ["transactions"] });
               qc.invalidateQueries({ queryKey: ["dashboard"] });
+              qc.invalidateQueries({ queryKey: ["categories"] });
             }}
           />
         </div>
@@ -192,6 +215,7 @@ export default function Transactions() {
         />
         <select
           className="text-sm border border-gray-300 rounded-lg px-3 py-1.5"
+          value={filters.categoryId || ""}
           onChange={(e) => updateFilter("categoryId", e.target.value || undefined)}
         >
           <option value="">All Categories</option>
@@ -204,6 +228,7 @@ export default function Transactions() {
         </select>
         <select
           className="text-sm border border-gray-300 rounded-lg px-3 py-1.5"
+          value={filters.needsReview || ""}
           onChange={(e) => updateFilter("needsReview", e.target.value || undefined)}
         >
           <option value="">All Status</option>

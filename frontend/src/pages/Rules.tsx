@@ -64,12 +64,15 @@ export default function Rules() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["rules"] }),
   });
 
+  const [applyMessage, setApplyMessage] = useState<string | null>(null);
+
   const applyMutation = useMutation({
     mutationFn: applyAllRules,
     onSuccess: (data) => {
-      alert(`Rules applied to ${data.updated} transactions.`);
+      setApplyMessage(`Rules applied to ${data.updated} transactions.`);
       qc.invalidateQueries({ queryKey: ["transactions"] });
       qc.invalidateQueries({ queryKey: ["dashboard"] });
+      setTimeout(() => setApplyMessage(null), 5000);
     },
   });
 
@@ -85,6 +88,9 @@ export default function Rules() {
           >
             {applyMutation.isPending ? "Running…" : "Re-run All Rules"}
           </button>
+          {applyMessage && (
+            <span className="text-sm text-green-700 font-medium">{applyMessage}</span>
+          )}
           <button
             onClick={() => setShowAdd(!showAdd)}
             className="px-4 py-2 text-sm font-medium rounded-lg bg-indigo-600 text-white hover:bg-indigo-700"

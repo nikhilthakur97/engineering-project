@@ -1,3 +1,4 @@
+import { useMemo } from "react";
 import {
   BarChart,
   Bar,
@@ -21,18 +22,15 @@ interface Props {
 }
 
 export default function SpendingChart({ data, categories }: Props) {
-  // Format month labels: "2025-01" → "Jan 25"
-  const formatted = data.map((row) => {
+  const formatted = useMemo(() => data.map((row) => {
+    if (!row.month || !row.month.includes("-")) return row;
     const [year, month] = row.month.split("-");
     const date = new Date(Number(year), Number(month) - 1);
     return {
       ...row,
-      month: date.toLocaleDateString("en-US", {
-        month: "short",
-        year: "2-digit",
-      }),
+      month: date.toLocaleDateString("en-US", { month: "short", year: "2-digit" }),
     };
-  });
+  }), [data]);
 
   return (
     <ResponsiveContainer width="100%" height={300}>
