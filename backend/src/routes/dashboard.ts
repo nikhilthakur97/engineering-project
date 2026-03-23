@@ -3,9 +3,22 @@ import { prisma } from "../db";
 
 const router = Router();
 
+// In-memory cache for dashboard summary (avoids 4 COUNT queries every poll)
+const SUMMARY_TTL_MS = 5_000;
+let summaryCache: { data: any; expires: number } | null = null;
+
+export function invalidateSummaryCache() {
+  summaryCache = null;
+}
+
 // GET /api/dashboard/summary — counts for the review dashboard
 router.get("/summary", async (_req, res, next) => {
   try {
+    if (summaryCache && Date.now() < summaryCache.expires) {
+      res.json(summaryCache.data);
+      return;
+    }
+
     const [total, uncategorized, flagged, needsReview] = await Promise.all([
       prisma.transaction.count(),
       prisma.transaction.count({ where: { categoryId: null } }),
@@ -15,7 +28,9 @@ router.get("/summary", async (_req, res, next) => {
       prisma.transaction.count({ where: { needsReview: true } }),
     ]);
 
-    res.json({ total, uncategorized, flagged, needsReview });
+    const data = { total, uncategorized, flagged, needsReview };
+    summaryCache = { data, expires: Date.now() + SUMMARY_TTL_MS };
+    res.json(data);
   } catch (err) {
     next(err);
   }
