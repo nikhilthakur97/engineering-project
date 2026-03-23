@@ -9,6 +9,7 @@ import {
   applyAllRules,
   type Rule,
   type Category,
+  type RulePayload,
 } from "../lib/api";
 
 const CONDITION_TYPES = [
@@ -34,6 +35,7 @@ const AVAILABLE_FLAGS = [
 export default function Rules() {
   const qc = useQueryClient();
   const [showAdd, setShowAdd] = useState(false);
+  const [editingId, setEditingId] = useState<number | null>(null);
 
   const { data: rules = [] } = useQuery<Rule[]>({
     queryKey: ["rules"],
@@ -50,6 +52,15 @@ export default function Rules() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["rules"] });
       setShowAdd(false);
+    },
+  });
+
+  const updateMutation = useMutation({
+    mutationFn: ({ id, ...body }: RulePayload & { id: number }) =>
+      updateRule(id, body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["rules"] });
+      setEditingId(null);
     },
   });
 
@@ -127,61 +138,82 @@ export default function Rules() {
                   : "border-gray-100 opacity-60"
               }`}
             >
-              <div className="flex-1">
-                <div className="flex items-center gap-2 mb-1">
-                  <span className="font-medium text-gray-900 text-sm">
-                    {rule.name}
-                  </span>
-                  <span className="text-xs text-gray-400">
-                    Priority: {rule.priority}
-                  </span>
+              {editingId === rule.id ? (
+                <div className="flex-1">
+                  <RuleForm
+                    categories={categories}
+                    initial={rule}
+                    submitLabel="Save Changes"
+                    onSubmit={(data) => updateMutation.mutate({ id: rule.id, ...data })}
+                    onCancel={() => setEditingId(null)}
+                    loading={updateMutation.isPending}
+                  />
                 </div>
-                <p className="text-sm text-gray-600">
-                  If{" "}
-                  <span className="font-medium text-gray-800">
-                    {CONDITION_TYPES.find(
-                      (c) => c.value === rule.conditionType
-                    )?.label || rule.conditionType}
-                  </span>{" "}
-                  <span className="text-indigo-600 font-mono">
-                    "{rule.conditionValue}"
-                  </span>{" "}
-                  → {" "}
-                  <span className="font-medium text-gray-800">
-                    {ACTION_TYPES.find((a) => a.value === rule.actionType)
-                      ?.label || rule.actionType}
-                  </span>{" "}
-                  <span className="text-indigo-600 font-mono">
-                    "{rule.actionValue}"
-                  </span>
-                </p>
-              </div>
-              <div className="flex items-center gap-2 ml-4">
-                <button
-                  onClick={() =>
-                    toggleMutation.mutate({
-                      id: rule.id,
-                      active: !rule.active,
-                    })
-                  }
-                  className={`text-xs px-3 py-1 rounded-lg font-medium ${
-                    rule.active
-                      ? "bg-green-50 text-green-700 hover:bg-green-100"
-                      : "bg-gray-100 text-gray-500 hover:bg-gray-200"
-                  }`}
-                >
-                  {rule.active ? "Active" : "Disabled"}
-                </button>
-                <button
-                  onClick={() => {
-                    if (confirm("Delete this rule?"))
-                      deleteMutation.mutate(rule.id);
-                  }}
-                  className="text-xs px-2 py-1 rounded bg-red-50 text-red-700 hover:bg-red-100"
-                >
-                  Delete
-                </button>
-              </div>
+              ) : (
+                <>
+                  <div className="flex-1">
+                    <div className="flex items-center gap-2 mb-1">
+                      <span className="font-medium text-gray-900 text-sm">
+                        {rule.name}
+                      </span>
+                      <span className="text-xs text-gray-400">
+                        Priority: {rule.priority}
+                      </span>
+                    </div>
+                    <p className="text-sm text-gray-600">
+                      If{" "}
+                      <span className="font-medium text-gray-800">
+                        {CONDITION_TYPES.find(
+                          (c) => c.value === rule.conditionType
+                        )?.label || rule.conditionType}
+                      </span>{" "}
+                      <span className="text-indigo-600 font-mono">
+                        "{rule.conditionValue}"
+                      </span>{" "}
+                      {"→ "}
+                      <span className="font-medium text-gray-800">
+                        {ACTION_TYPES.find((a) => a.value === rule.actionType)
+                          ?.label || rule.actionType}
+                      </span>{" "}
+                      <span className="text-indigo-600 font-mono">
+                        "{rule.actionValue}"
+                      </span>
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2 ml-4">
+                    <button
+                      onClick={() =>
+                        toggleMutation.mutate({
+                          id: rule.id,
+                          active: !rule.active,
+                        })
+                      }
+                      className={`text-xs px-3 py-1 rounded-lg font-medium ${
+                        rule.active
+                          ? "bg-green-50 text-green-700 hover:bg-green-100"
+                          : "bg-gray-100 text-gray-500 hover:bg-gray-200"
+                      }`}
+                    >
+                      {rule.active ? "Active" : "Disabled"}
+                    </button>
+                    <button
+                      onClick={() => setEditingId(rule.id)}
+                      className="text-xs px-2 py-1 rounded bg-gray-100 text-gray-700 hover:bg-gray-200"
+                    >
+                      Edit
+                    </button>
+                    <button
+                      onClick={() => {
+                        if (confirm("Delete this rule?"))
+                          deleteMutation.mutate(rule.id);
+                      }}
+                      className="text-xs px-2 py-1 rounded bg-red-50 text-red-700 hover:bg-red-100"
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </>
+              )}
             </div>
           ))
         )}
@@ -195,21 +227,31 @@ export default function Rules() {
 // ---------------------------------------------------------------------------
 function RuleForm({
   categories,
+  initial,
   onSubmit,
   onCancel,
   loading,
+  submitLabel = "Create Rule",
 }: {
   categories: Category[];
-  onSubmit: (data: Record<string, any>) => void;
+  initial?: Rule;
+  onSubmit: (data: RulePayload) => void;
   onCancel: () => void;
   loading?: boolean;
+  submitLabel?: string;
 }) {
-  const [name, setName] = useState("");
-  const [conditionType, setConditionType] = useState("description_contains");
-  const [conditionValue, setConditionValue] = useState("");
-  const [actionType, setActionType] = useState("set_category");
-  const [actionValue, setActionValue] = useState("");
-  const [priority, setPriority] = useState("0");
+  const [name, setName] = useState(initial?.name || "");
+  const [conditionType, setConditionType] = useState(
+    initial?.conditionType || "description_contains"
+  );
+  const [conditionValue, setConditionValue] = useState(
+    initial?.conditionValue || ""
+  );
+  const [actionType, setActionType] = useState(
+    initial?.actionType || "set_category"
+  );
+  const [actionValue, setActionValue] = useState(initial?.actionValue || "");
+  const [priority, setPriority] = useState(String(initial?.priority ?? 0));
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -348,7 +390,7 @@ function RuleForm({
           disabled={loading}
           className="px-4 py-2 bg-indigo-600 text-white text-sm font-medium rounded-lg hover:bg-indigo-700 disabled:opacity-50"
         >
-          {loading ? "Creating…" : "Create Rule"}
+          {loading ? "Saving…" : submitLabel}
         </button>
         <button
           type="button"

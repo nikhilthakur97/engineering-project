@@ -1,0 +1,13 @@
+date,description,amount,category
+2025-03-01,Normal Transaction,50.00,Shopping
+not-a-date,Bad Date Row,25.00,Shopping
+2025-03-03,,75.00,Other
+2025-03-04,Missing Amount,,Shopping
+2025-03-05,Bad Amount,abc,Shopping
+2025-03-06,Dollar Sign Amount,$1250.00,Shopping
+2025-03-07,Comma Amount,"1,500.00",Shopping
+2025-03-01,Normal Transaction,50.00,Shopping
+2025-03-10,Unknown Category,30.00,NonExistentCategory
+2025-03-11,No Category At All,99.99,
+2025-03-12,Negative Amount,-50.00,Other
+2025-03-15,Extra Whitespace   ,  45.00  , Shopping

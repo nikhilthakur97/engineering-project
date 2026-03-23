@@ -9,8 +9,10 @@ import {
   deleteTransaction,
   bulkAction,
   type Category,
+  type TransactionPayload,
 } from "../lib/api";
 import AnomalyBadge from "../components/AnomalyBadge";
+import ReviewReasons from "../components/ReviewReasons";
 import TransactionForm from "../components/TransactionForm";
 import CsvUpload from "../components/CsvUpload";
 
@@ -35,49 +37,25 @@ export default function Transactions() {
 
   const [searchInput, setSearchInput] = useState("");
   const debouncedSearch = useDebounce(searchInput, 300);
-  const [filters, setFilters] = useState<Record<string, string>>(() => {
-    const initial: Record<string, string> = {};
-    const nr = searchParams.get("needsReview");
-    if (nr) initial.needsReview = nr;
-    return initial;
-  });
+  const [categoryFilter, setCategoryFilter] = useState(
+    searchParams.get("categoryId") || ""
+  );
+  const [needsReviewFilter, setNeedsReviewFilter] = useState(
+    searchParams.get("needsReview") || ""
+  );
 
-  const needsReviewFromUrl = searchParams.get("needsReview");
-  useEffect(() => {
-    const nr = needsReviewFromUrl && needsReviewFromUrl !== "" ? needsReviewFromUrl : null;
-    setFilters((f) => {
-      if (nr !== null && f.needsReview !== nr) {
-        return { ...f, needsReview: nr };
-      }
-      if (nr === null && f.needsReview !== undefined) {
-        const { needsReview, ...rest } = f;
-        return rest;
-      }
-      return f;
-    });
-  }, [needsReviewFromUrl]);
-
-  const updateFilter = useCallback((key: string, value: string | undefined) => {
-    setFilters((f) => {
-      const next = { ...f };
-      if (value) next[key] = value;
-      else delete next[key];
-      return next;
-    });
+  const resetListState = useCallback(() => {
     setCursor(undefined);
+    setSelected(new Set());
   }, []);
 
   const queryParams = useMemo(() => {
-    const params: Record<string, string> = { ...filters };
+    const params: Record<string, string> = {};
     if (debouncedSearch) params.search = debouncedSearch;
+    if (categoryFilter) params.categoryId = categoryFilter;
+    if (needsReviewFilter) params.needsReview = needsReviewFilter;
     return params;
-  }, [filters, debouncedSearch]);
-
-  // Reset to first page and clear selections whenever filters or search change
-  useEffect(() => {
-    setCursor(undefined);
-    setSelected(new Set());
-  }, [queryParams]);
+  }, [categoryFilter, needsReviewFilter, debouncedSearch]);
 
   const { data: categories = [] } = useQuery<Category[]>({
     queryKey: ["categories"],
@@ -102,7 +80,14 @@ export default function Transactions() {
   });
 
   const updateMutation = useMutation({
-    mutationFn: ({ id, ...body }: Record<string, any>) =>
+    mutationFn: ({
+      id,
+      ...body
+    }: Partial<TransactionPayload> & {
+      id: number;
+      needsReview?: boolean;
+      anomalyFlags?: string[];
+    }) =>
       updateTransaction(id, body),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["transactions"] });
@@ -132,7 +117,8 @@ export default function Transactions() {
   function toggleSelect(id: number) {
     setSelected((prev) => {
       const next = new Set(prev);
-      next.has(id) ? next.delete(id) : next.add(id);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
       return next;
     });
   }
@@ -211,12 +197,18 @@ export default function Transactions() {
           placeholder="Search description…"
           value={searchInput}
           className="text-sm border border-gray-300 rounded-lg px-3 py-1.5"
-          onChange={(e) => setSearchInput(e.target.value)}
+          onChange={(e) => {
+            setSearchInput(e.target.value);
+            resetListState();
+          }}
         />
         <select
           className="text-sm border border-gray-300 rounded-lg px-3 py-1.5"
-          value={filters.categoryId || ""}
-          onChange={(e) => updateFilter("categoryId", e.target.value || undefined)}
+          value={categoryFilter}
+          onChange={(e) => {
+            setCategoryFilter(e.target.value);
+            resetListState();
+          }}
         >
           <option value="">All Categories</option>
           <option value="null">Uncategorized</option>
@@ -228,8 +220,11 @@ export default function Transactions() {
         </select>
         <select
           className="text-sm border border-gray-300 rounded-lg px-3 py-1.5"
-          value={filters.needsReview || ""}
-          onChange={(e) => updateFilter("needsReview", e.target.value || undefined)}
+          value={needsReviewFilter}
+          onChange={(e) => {
+            setNeedsReviewFilter(e.target.value);
+            resetListState();
+          }}
         >
           <option value="">All Status</option>
           <option value="true">Needs Review</option>
@@ -392,6 +387,7 @@ export default function Transactions() {
                         <AnomalyBadge key={f} flag={f} />
                       ))}
                     </div>
+                    <ReviewReasons reasons={tx.reviewReasons} />
                   </td>
                   <td className="px-4 py-3 text-right">
                     {editingId !== tx.id && (

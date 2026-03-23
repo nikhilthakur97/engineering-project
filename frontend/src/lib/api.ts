@@ -19,7 +19,9 @@ export interface Transaction {
   amountCents: number;
   categoryId: number | null;
   category: Category | null;
+  categorySource: "manual" | "import" | "rule";
   anomalyFlags: string[];
+  reviewReasons: string[];
   needsReview: boolean;
   createdAt: string;
   updatedAt: string;
@@ -57,18 +59,39 @@ export interface ImportResult {
   errors: { row: number; message: string }[];
 }
 
+export interface TransactionPayload {
+  date: string;
+  description: string | null;
+  amount: number;
+  categoryId: number | null;
+}
+
+export interface RulePayload {
+  name: string;
+  conditionType: string;
+  conditionValue: string;
+  actionType: string;
+  actionValue: string;
+  priority: number;
+}
+
+export interface SpendingRow {
+  month: string;
+  [category: string]: string | number;
+}
+
 // ---------------------------------------------------------------------------
 // Transactions
 // ---------------------------------------------------------------------------
 export async function fetchTransactions(
-  params: Record<string, any> = {}
+  params: Record<string, string | number | boolean | null | undefined> = {}
 ): Promise<TransactionListResponse> {
   const { data } = await api.get("/transactions", { params });
   return data;
 }
 
 export async function createTransaction(
-  body: Record<string, any>
+  body: TransactionPayload
 ): Promise<Transaction> {
   const { data } = await api.post("/transactions", body);
   return data;
@@ -76,7 +99,10 @@ export async function createTransaction(
 
 export async function updateTransaction(
   id: number,
-  body: Record<string, any>
+  body: Partial<TransactionPayload> & {
+    needsReview?: boolean;
+    anomalyFlags?: string[];
+  }
 ): Promise<Transaction> {
   const { data } = await api.put(`/transactions/${id}`, body);
   return data;
@@ -134,14 +160,14 @@ export async function fetchRules(): Promise<Rule[]> {
   return data;
 }
 
-export async function createRule(body: Record<string, any>): Promise<Rule> {
+export async function createRule(body: RulePayload): Promise<Rule> {
   const { data } = await api.post("/rules", body);
   return data;
 }
 
 export async function updateRule(
   id: number,
-  body: Record<string, any>
+  body: Partial<RulePayload> & { active?: boolean }
 ): Promise<Rule> {
   const { data } = await api.put(`/rules/${id}`, body);
   return data;
@@ -165,7 +191,7 @@ export async function fetchDashboardSummary(): Promise<DashboardSummary> {
 }
 
 export interface SpendingData {
-  data: Record<string, any>[];
+  data: SpendingRow[];
   categories: string[];
 }
 

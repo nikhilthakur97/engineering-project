@@ -7,13 +7,14 @@ import {
   bulkAction,
   updateTransaction,
   deleteTransaction,
-  type Transaction,
   type Category,
+  type TransactionPayload,
 } from "../lib/api";
 import AnomalyBadge from "../components/AnomalyBadge";
+import ReviewReasons from "../components/ReviewReasons";
 import TransactionForm from "../components/TransactionForm";
 import SpendingChart from "../components/SpendingChart";
-import { useState, useMemo } from "react";
+import { useState, useMemo, useCallback } from "react";
 
 type Tab = "uncategorized" | "flagged" | "needsReview";
 
@@ -23,6 +24,13 @@ export default function Dashboard() {
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [editingId, setEditingId] = useState<number | null>(null);
   const [bulkCategoryId, setBulkCategoryId] = useState("");
+  const [cursor, setCursor] = useState<number | undefined>();
+
+  const switchTab = useCallback((t: Tab) => {
+    setTab(t);
+    setSelected(new Set());
+    setCursor(undefined);
+  }, []);
 
   const { data: summary } = useQuery({
     queryKey: ["dashboard"],
@@ -41,18 +49,19 @@ export default function Dashboard() {
   });
 
   const params = useMemo(() => {
+    const base: Record<string, string | number | undefined> = { limit: 50, cursor };
     switch (tab) {
       case "uncategorized":
-        return { categoryId: "null", limit: 100 };
+        return { ...base, categoryId: "null" };
       case "flagged":
-        return { flagged: "true", limit: 100 };
+        return { ...base, flagged: "true" };
       case "needsReview":
-        return { needsReview: "true", limit: 100 };
+        return { ...base, needsReview: "true" };
     }
-  }, [tab]);
+  }, [tab, cursor]);
 
   const { data: txResponse } = useQuery({
-    queryKey: ["review", tab],
+    queryKey: ["review", tab, cursor],
     queryFn: () => fetchTransactions(params),
   });
 
@@ -64,6 +73,7 @@ export default function Dashboard() {
       qc.invalidateQueries({ queryKey: ["review"] });
       qc.invalidateQueries({ queryKey: ["dashboard"] });
       setSelected(new Set());
+      setCursor(undefined);
     },
   });
 
@@ -75,11 +85,19 @@ export default function Dashboard() {
       qc.invalidateQueries({ queryKey: ["dashboard"] });
       setSelected(new Set());
       setBulkCategoryId("");
+      setCursor(undefined);
     },
   });
 
   const updateMutation = useMutation({
-    mutationFn: ({ id, ...body }: Record<string, any>) =>
+    mutationFn: ({
+      id,
+      ...body
+    }: Partial<TransactionPayload> & {
+      id: number;
+      needsReview?: boolean;
+      anomalyFlags?: string[];
+    }) =>
       updateTransaction(id, body),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["review"] });
@@ -99,7 +117,8 @@ export default function Dashboard() {
   function toggleSelect(id: number) {
     setSelected((prev) => {
       const next = new Set(prev);
-      next.has(id) ? next.delete(id) : next.add(id);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
       return next;
     });
   }
@@ -130,10 +149,7 @@ export default function Dashboard() {
           <div
             key={card.label}
             onClick={() => {
-              if (card.tab) {
-                setTab(card.tab);
-                setSelected(new Set());
-              }
+              if (card.tab) switchTab(card.tab);
             }}
             className={`bg-white rounded-xl border border-gray-200 p-4 transition-colors ${
               card.tab
@@ -170,10 +186,7 @@ export default function Dashboard() {
         ]).map((t) => (
           <button
             key={t.key}
-            onClick={() => {
-              setTab(t.key);
-              setSelected(new Set());
-            }}
+            onClick={() => switchTab(t.key)}
             className={`px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${
               tab === t.key
                 ? "bg-white text-gray-900 shadow-sm"
@@ -330,6 +343,7 @@ export default function Dashboard() {
                         <AnomalyBadge key={f} flag={f} />
                       ))}
                     </div>
+                    <ReviewReasons reasons={tx.reviewReasons} />
                   </td>
                   <td className="px-4 py-3 text-right">
                     {editingId !== tx.id && (
@@ -365,6 +379,33 @@ export default function Dashboard() {
             )}
           </tbody>
         </table>
+
+        {/* Pagination */}
+        {txResponse && (transactions.length > 0 || cursor) && (
+          <div className="flex items-center justify-between px-4 py-3 border-t border-gray-200 bg-gray-50">
+            <span className="text-xs text-gray-500">
+              Showing {transactions.length} transactions
+            </span>
+            <div className="flex gap-2">
+              {cursor && (
+                <button
+                  onClick={() => { setCursor(undefined); setSelected(new Set()); }}
+                  className="text-sm px-3 py-1 rounded-lg border border-gray-300 bg-white hover:bg-gray-50"
+                >
+                  &larr; First Page
+                </button>
+              )}
+              {txResponse.hasMore && txResponse.nextCursor && (
+                <button
+                  onClick={() => { setCursor(txResponse.nextCursor!); setSelected(new Set()); }}
+                  className="text-sm px-3 py-1 rounded-lg border border-gray-300 bg-white hover:bg-gray-50"
+                >
+                  Next &rarr;
+                </button>
+              )}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

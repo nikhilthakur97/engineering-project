@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from "react";
+import axios from "axios";
 import {
   importCsv,
   fetchImportProgress,
@@ -35,7 +36,9 @@ export default function CsvUpload({ onComplete }: Props) {
       try {
         const p = await fetchImportProgress();
         if (p.phase !== "idle") setProgress(p);
-      } catch {}
+      } catch {
+        // Keep polling quietly; import progress is best-effort UI state.
+      }
     }, 1000);
 
     return () => {
@@ -53,13 +56,18 @@ export default function CsvUpload({ onComplete }: Props) {
       const res = await importCsv(file);
       setResult(res);
       onComplete();
-    } catch (err: any) {
+    } catch (err: unknown) {
+      const message = axios.isAxiosError(err)
+        ? (err.response?.data as { error?: string } | undefined)?.error || err.message
+        : err instanceof Error
+          ? err.message
+          : "Upload failed";
       setResult({
         imported: 0,
         skipped: 0,
         failed: 0,
         errors: [
-          { row: 0, message: err.response?.data?.error || err.message },
+          { row: 0, message },
         ],
       });
     } finally {

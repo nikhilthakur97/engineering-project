@@ -9,6 +9,8 @@ import {
   Legend,
   ResponsiveContainer,
 } from "recharts";
+import type { NameType, ValueType } from "recharts/types/component/DefaultTooltipContent";
+import type { SpendingRow } from "../lib/api";
 
 const COLORS = [
   "#6366f1", "#f59e0b", "#10b981", "#ef4444", "#8b5cf6",
@@ -17,7 +19,7 @@ const COLORS = [
 ];
 
 interface Props {
-  data: Record<string, any>[];
+  data: SpendingRow[];
   categories: string[];
 }
 
@@ -49,10 +51,13 @@ export default function SpendingChart({ data, categories }: Props) {
           tickFormatter={(v) => `$${v.toLocaleString()}`}
         />
         <Tooltip
-          formatter={(value: number, name: string) => [
-            `$${value.toLocaleString("en-US", { minimumFractionDigits: 2 })}`,
-            name,
-          ]}
+          formatter={(value: ValueType | undefined, name: NameType | undefined) => {
+            const amount = typeof value === "number" ? value : Number(value ?? 0);
+            return [
+              `$${amount.toLocaleString("en-US", { minimumFractionDigits: 2 })}`,
+              String(name ?? ""),
+            ];
+          }}
           contentStyle={{
             borderRadius: "8px",
             border: "1px solid #e5e7eb",
