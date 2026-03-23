@@ -1,12 +1,18 @@
 import { Router } from "express";
 import multer from "multer";
-import { prisma } from "../index";
+import { prisma } from "../db";
 import { importCsv, getImportProgress } from "../services/csvImporter";
 import { evaluateRules, applyRulesToExisting } from "../services/ruleEngine";
 import { detectAnomalies } from "../services/anomalyDetector";
 
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
+
+function stripRuleCategoryReasons(reasons: string[] | undefined): string[] {
+  return (reasons || []).filter(
+    (reason) => !(reason.startsWith("Rule match:") && reason.includes("set category"))
+  );
+}
 
 // ---------------------------------------------------------------------------
 // GET /api/transactions — list with cursor pagination and filters
@@ -168,44 +174,64 @@ router.post("/", async (req, res, next) => {
     const ruleResult = await evaluateRules(
       prisma,
       { description: desc, amountCents },
-      catId
+      {
+        existingCategoryId: catId,
+        existingCategorySource: "manual",
+      }
     );
 
     const finalCategoryId = ruleResult.categoryId;
 
-    // Insert first so anomaly detection can compare against DB
-    const transaction = await prisma.transaction.create({
-      data: {
+    let createdId: number | null = null;
+
+    try {
+      // Insert first so anomaly detection can compare against DB
+      const transaction = await prisma.transaction.create({
+        data: {
+          date: new Date(date),
+          description: desc,
+          amountCents,
+          categoryId: finalCategoryId,
+          categorySource: ruleResult.categorySource,
+          anomalyFlags: ruleResult.flags,
+          reviewReasons: ruleResult.reasons,
+          needsReview: true, // temporary; updated after anomaly check
+        },
+        include: { category: true },
+      });
+      createdId = transaction.id;
+
+      // Run anomaly detection
+      const anomalyResult = await detectAnomalies(prisma, {
+        id: transaction.id,
         date: new Date(date),
         description: desc,
         amountCents,
         categoryId: finalCategoryId,
-        anomalyFlags: ruleResult.flags,
-        needsReview: true, // temporary; updated after anomaly check
-      },
-      include: { category: true },
-    });
+      });
 
-    // Run anomaly detection
-    const anomalyResult = await detectAnomalies(prisma, {
-      id: transaction.id,
-      date: new Date(date),
-      description: desc,
-      amountCents,
-      categoryId: finalCategoryId,
-    });
+      const allFlags = [...new Set([...ruleResult.flags, ...anomalyResult.flags])];
+      const reviewReasons = [
+        ...new Set([...ruleResult.reasons, ...anomalyResult.reasons]),
+      ];
+      const needsReview = allFlags.length > 0 || finalCategoryId === null || !desc;
 
-    const allFlags = [...new Set([...ruleResult.flags, ...anomalyResult.flags])];
-    const needsReview = allFlags.length > 0 || finalCategoryId === null;
+      // Update with final flags
+      const updated = await prisma.transaction.update({
+        where: { id: transaction.id },
+        data: { anomalyFlags: allFlags, reviewReasons, needsReview },
+        include: { category: true },
+      });
 
-    // Update with final flags
-    const updated = await prisma.transaction.update({
-      where: { id: transaction.id },
-      data: { anomalyFlags: allFlags, needsReview },
-      include: { category: true },
-    });
-
-    res.status(201).json(formatTransaction(updated));
+      res.status(201).json(formatTransaction(updated));
+    } catch (err) {
+      if (createdId !== null) {
+        await prisma.transaction.delete({ where: { id: createdId } }).catch(() => {
+          // Best-effort cleanup to avoid leaving a half-processed row behind.
+        });
+      }
+      throw err;
+    }
   } catch (err) {
     next(err);
   }
@@ -228,8 +254,15 @@ router.put("/:id", async (req, res, next) => {
       return;
     }
 
-    const { date, description, amount, categoryId, needsReview, anomalyFlags } =
-      req.body;
+    const {
+      date,
+      description,
+      amount,
+      categoryId,
+      needsReview,
+      anomalyFlags,
+      reviewReasons,
+    } = req.body;
 
     const updateData: any = {};
     if (date !== undefined) updateData.date = new Date(date);
@@ -237,10 +270,18 @@ router.put("/:id", async (req, res, next) => {
       updateData.description = description?.trim() || null;
     if (amount !== undefined)
       updateData.amountCents = Math.round(Number(amount) * 100);
-    if (categoryId !== undefined)
+    if (categoryId !== undefined) {
       updateData.categoryId = categoryId ? Number(categoryId) : null;
+      updateData.categorySource = "manual";
+      updateData.reviewReasons = stripRuleCategoryReasons(existing.reviewReasons);
+    }
     if (needsReview !== undefined) updateData.needsReview = needsReview;
     if (anomalyFlags !== undefined) updateData.anomalyFlags = anomalyFlags;
+    if (reviewReasons !== undefined) {
+      updateData.reviewReasons = categoryId !== undefined
+        ? stripRuleCategoryReasons(reviewReasons)
+        : reviewReasons;
+    }
 
     const transaction = await prisma.transaction.update({
       where: { id },
@@ -297,15 +338,26 @@ router.patch("/bulk", async (req, res, next) => {
         res.status(400).json({ error: "categoryId is required for categorize" });
         return;
       }
-      const result = await prisma.transaction.updateMany({
+      const catIdNum = Number(categoryId);
+      const transactions = await prisma.transaction.findMany({
         where: { id: { in: numericIds } },
-        data: { categoryId: Number(categoryId) },
+        select: { id: true, reviewReasons: true },
       });
-      res.json({ updated: result.count });
+      for (const tx of transactions) {
+        await prisma.transaction.update({
+          where: { id: tx.id },
+          data: {
+            categoryId: catIdNum,
+            categorySource: "manual",
+            reviewReasons: stripRuleCategoryReasons(tx.reviewReasons),
+          },
+        });
+      }
+      res.json({ updated: transactions.length });
     } else if (action === "approve") {
       const result = await prisma.transaction.updateMany({
         where: { id: { in: numericIds } },
-        data: { needsReview: false, anomalyFlags: [] },
+        data: { needsReview: false, anomalyFlags: [], reviewReasons: [] },
       });
       res.json({ updated: result.count });
     } else if (action === "rerun_rules") {
@@ -357,7 +409,9 @@ function formatTransaction(t: any) {
     amountCents: t.amountCents,
     categoryId: t.categoryId,
     category: t.category || null,
+    categorySource: t.categorySource,
     anomalyFlags: t.anomalyFlags,
+    reviewReasons: t.reviewReasons,
     needsReview: t.needsReview,
     createdAt: t.createdAt,
     updatedAt: t.updatedAt,

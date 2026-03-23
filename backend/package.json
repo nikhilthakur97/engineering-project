@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "nodemon --exec ts-node src/index.ts",
     "build": "tsc",
+    "test": "node --require ts-node/register/transpile-only --test src/**/*.test.ts",
     "start": "node dist/index.js",
     "db:migrate": "npx prisma migrate dev",
     "db:seed": "ts-node prisma/seed.ts",

@@ -18,16 +18,18 @@ model Category {
 }
 
 model Transaction {
-  id           Int       @id @default(autoincrement())
-  date         DateTime  @db.Date
-  description  String?   @db.Text
-  amountCents  Int       @map("amount_cents")
-  categoryId   Int?      @map("category_id")
-  category     Category? @relation(fields: [categoryId], references: [id])
-  anomalyFlags String[]  @default([]) @map("anomaly_flags")
-  needsReview  Boolean   @default(false) @map("needs_review")
-  createdAt    DateTime  @default(now()) @map("created_at")
-  updatedAt    DateTime  @updatedAt @map("updated_at")
+  id             Int       @id @default(autoincrement())
+  date           DateTime  @db.Date
+  description    String?   @db.Text
+  amountCents    Int       @map("amount_cents")
+  categoryId     Int?      @map("category_id")
+  category       Category? @relation(fields: [categoryId], references: [id])
+  categorySource String    @default("manual") @map("category_source") @db.VarChar(20)
+  anomalyFlags   String[]  @default([]) @map("anomaly_flags")
+  reviewReasons  String[]  @default([]) @map("review_reasons")
+  needsReview    Boolean   @default(false) @map("needs_review")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
 
   @@index([date])
   @@index([categoryId])

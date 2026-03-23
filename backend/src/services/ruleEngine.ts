@@ -2,7 +2,9 @@ import { PrismaClient } from "../../generated/prisma/client";
 
 export interface RuleResult {
   categoryId: number | null;
+  categorySource: "manual" | "import" | "rule";
   flags: string[];
+  reasons: string[];
 }
 
 interface TransactionInput {
@@ -11,10 +13,20 @@ interface TransactionInput {
 }
 
 interface RuleData {
+  id?: number;
+  name?: string;
   conditionType: string;
   conditionValue: string;
   actionType: string;
   actionValue: string;
+}
+
+export type CategorySource = "manual" | "import" | "rule";
+
+interface EvaluateRulesOptions {
+  existingCategoryId?: number | null;
+  existingCategorySource?: CategorySource;
+  preloadedRules?: RuleData[];
 }
 
 /**
@@ -28,9 +40,13 @@ interface RuleData {
 export async function evaluateRules(
   prisma: PrismaClient,
   tx: TransactionInput,
-  existingCategoryId?: number | null,
-  preloadedRules?: RuleData[]
+  options: EvaluateRulesOptions = {}
 ): Promise<RuleResult> {
+  const {
+    existingCategoryId,
+    existingCategorySource = "manual",
+    preloadedRules,
+  } = options;
   const rules =
     preloadedRules ??
     (await prisma.rule.findMany({
@@ -39,26 +55,65 @@ export async function evaluateRules(
     }));
 
   let categoryId: number | null = existingCategoryId ?? null;
+  let categorySource: CategorySource =
+    existingCategoryId === null ? existingCategorySource : existingCategorySource;
+  const canAutoCategorize = categoryId === null || categorySource !== "manual";
   const flags: string[] = [];
+  const reasons: string[] = [];
 
   for (const rule of rules) {
     if (!matchesCondition(rule, tx)) continue;
 
-    if (rule.actionType === "set_category" && categoryId === null) {
+    if (
+      rule.actionType === "set_category" &&
+      canAutoCategorize &&
+      categorySource !== "rule"
+    ) {
       const resolved = await resolveCategory(prisma, rule.actionValue);
-      if (resolved !== null) categoryId = resolved;
+      if (resolved !== null && categoryId !== resolved) {
+        categoryId = resolved;
+        categorySource = "rule";
+        reasons.push(
+          `Rule match: "${rule.name ?? rule.conditionValue}" set category to "${rule.actionValue}".`
+        );
+      }
     } else if (rule.actionType === "add_flag") {
       const flag = rule.actionValue.trim();
-      if (flag && !flags.includes(flag)) flags.push(flag);
+      if (flag && !flags.includes(flag)) {
+        flags.push(flag);
+        reasons.push(
+          `Rule match: "${rule.name ?? rule.conditionValue}" added flag "${flag}".`
+        );
+      }
     }
   }
 
-  return { categoryId, flags };
+  return { categoryId, categorySource, flags, reasons };
+}
+
+const ANOMALY_FLAGS = new Set(["incomplete", "possible_duplicate", "unusual_amount"]);
+
+/**
+ * Merge new rule-engine flags/reasons with a transaction's existing anomaly
+ * flags/reasons so that re-running rules never silently discards anomaly data.
+ */
+function mergeWithExistingAnomalyData(
+  ruleResult: RuleResult,
+  existingFlags: string[],
+  existingReasons: string[]
+): { flags: string[]; reasons: string[] } {
+  const preservedFlags = existingFlags.filter((f) => ANOMALY_FLAGS.has(f));
+  const preservedReasons = existingReasons.filter((r) => r.startsWith("Anomaly:"));
+  return {
+    flags: [...new Set([...preservedFlags, ...ruleResult.flags])],
+    reasons: [...new Set([...preservedReasons, ...ruleResult.reasons])],
+  };
 }
 
 /**
  * Apply rules to a batch of transactions (by ID, or all if omitted).
  * Pre-loads rules once and processes in batches of 1000 for scalability.
+ * Preserves existing anomaly-detector flags so they are not wiped out.
  */
 export async function applyRulesToExisting(
   prisma: PrismaClient,
@@ -74,18 +129,35 @@ export async function applyRulesToExisting(
   if (transactionIds) {
     const transactions = await prisma.transaction.findMany({
       where: { id: { in: transactionIds } },
-      select: { id: true, description: true, amountCents: true },
+      select: {
+        id: true,
+        description: true,
+        amountCents: true,
+        categoryId: true,
+        categorySource: true,
+        anomalyFlags: true,
+        reviewReasons: true,
+      },
     });
 
     for (const tx of transactions) {
-      const result = await evaluateRules(prisma, tx, null, rules);
-      const needsReview = result.flags.length > 0 || result.categoryId === null;
+      const result = await evaluateRules(prisma, tx, {
+        existingCategoryId: tx.categoryId,
+        existingCategorySource: normalizeCategorySource(tx.categorySource),
+        preloadedRules: rules,
+      });
+      const merged = mergeWithExistingAnomalyData(
+        result, tx.anomalyFlags, tx.reviewReasons
+      );
+      const needsReview = merged.flags.length > 0 || result.categoryId === null;
 
       await prisma.transaction.update({
         where: { id: tx.id },
         data: {
           categoryId: result.categoryId,
-          anomalyFlags: result.flags,
+          categorySource: result.categorySource,
+          anomalyFlags: merged.flags,
+          reviewReasons: merged.reasons,
           needsReview,
         },
       });
@@ -98,7 +170,15 @@ export async function applyRulesToExisting(
     while (true) {
       const transactions = await prisma.transaction.findMany({
         where: { id: { gt: lastId } },
-        select: { id: true, description: true, amountCents: true },
+        select: {
+          id: true,
+          description: true,
+          amountCents: true,
+          categoryId: true,
+          categorySource: true,
+          anomalyFlags: true,
+          reviewReasons: true,
+        },
         orderBy: { id: "asc" },
         take: BATCH_SIZE,
       });
@@ -106,14 +186,23 @@ export async function applyRulesToExisting(
       if (transactions.length === 0) break;
 
       for (const tx of transactions) {
-        const result = await evaluateRules(prisma, tx, null, rules);
-        const needsReview = result.flags.length > 0 || result.categoryId === null;
+        const result = await evaluateRules(prisma, tx, {
+          existingCategoryId: tx.categoryId,
+          existingCategorySource: normalizeCategorySource(tx.categorySource),
+          preloadedRules: rules,
+        });
+        const merged = mergeWithExistingAnomalyData(
+          result, tx.anomalyFlags, tx.reviewReasons
+        );
+        const needsReview = merged.flags.length > 0 || result.categoryId === null;
 
         await prisma.transaction.update({
           where: { id: tx.id },
           data: {
             categoryId: result.categoryId,
-            anomalyFlags: result.flags,
+            categorySource: result.categorySource,
+            anomalyFlags: merged.flags,
+            reviewReasons: merged.reasons,
             needsReview,
           },
         });
@@ -127,7 +216,7 @@ export async function applyRulesToExisting(
   return { updated };
 }
 
-function matchesCondition(
+export function matchesCondition(
   rule: { conditionType: string; conditionValue: string },
   tx: TransactionInput
 ): boolean {
@@ -154,6 +243,10 @@ function matchesCondition(
     default:
       return false;
   }
+}
+
+function normalizeCategorySource(value: string | null | undefined): CategorySource {
+  return value === "rule" || value === "import" ? value : "manual";
 }
 
 const CACHE_TTL_MS = 60_000;

@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { prisma } from "../index";
+import { prisma } from "../db";
 import { applyRulesToExisting } from "../services/ruleEngine";
 
 const router = Router();
@@ -13,6 +13,15 @@ const VALID_CONDITION_TYPES = [
 ];
 
 const VALID_ACTION_TYPES = ["set_category", "add_flag"];
+
+function parseBooleanInput(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    if (value === "true") return true;
+    if (value === "false") return false;
+  }
+  return undefined;
+}
 
 // GET /api/rules — list all
 router.get("/", async (_req, res, next) => {
@@ -96,11 +105,22 @@ router.put("/:id", async (req, res, next) => {
     if (actionValue !== undefined)
       updateData.actionValue = String(actionValue).trim();
     if (priority !== undefined) {
+      if (priority === "") {
+        res.status(400).json({ error: "priority must be a number" });
+        return;
+      }
       const p = Number(priority);
       if (isNaN(p)) { res.status(400).json({ error: "priority must be a number" }); return; }
       updateData.priority = p;
     }
-    if (active !== undefined) updateData.active = Boolean(active);
+    if (active !== undefined) {
+      const parsedActive = parseBooleanInput(active);
+      if (parsedActive === undefined) {
+        res.status(400).json({ error: "active must be a boolean" });
+        return;
+      }
+      updateData.active = parsedActive;
+    }
 
     const rule = await prisma.rule.update({ where: { id }, data: updateData });
     res.json(rule);
@@ -152,6 +172,7 @@ function validateRule(body: any): string | undefined {
   if (!body.actionValue && body.actionValue !== 0)
     return "actionValue is required";
   if (body.priority !== undefined && body.priority !== null) {
+    if (body.priority === "") return "priority must be a number";
     const p = Number(body.priority);
     if (isNaN(p)) return "priority must be a number";
   }

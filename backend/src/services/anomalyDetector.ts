@@ -2,6 +2,7 @@ import { PrismaClient } from "../../generated/prisma/client";
 
 export interface AnomalyResult {
   flags: string[];
+  reasons: string[];
 }
 
 interface TransactionInput {
@@ -21,12 +22,27 @@ export async function detectAnomalies(
   tx: TransactionInput
 ): Promise<AnomalyResult> {
   const flags: string[] = [];
+  const reasons: string[] = [];
 
-  if (checkMissingMetadata(tx)) flags.push("incomplete");
-  if (await checkDuplicate(prisma, tx)) flags.push("possible_duplicate");
-  if (await checkUnusualAmount(prisma, tx)) flags.push("unusual_amount");
+  if (checkMissingMetadata(tx)) {
+    flags.push("incomplete");
+    reasons.push("Anomaly: missing description metadata.");
+  }
+  if (await checkDuplicate(prisma, tx)) {
+    flags.push("possible_duplicate");
+    reasons.push(
+      "Anomaly: possible duplicate with the same date, amount, and similar description."
+    );
+  }
+  const unusualAmount = await checkUnusualAmount(prisma, tx);
+  if (unusualAmount.flagged) {
+    flags.push("unusual_amount");
+    reasons.push(
+      `Anomaly: amount is ${unusualAmount.zScore.toFixed(1)} standard deviations from the recent ${unusualAmount.scope} average.`
+    );
+  }
 
-  return { flags };
+  return { flags, reasons };
 }
 
 /**
@@ -67,6 +83,7 @@ export async function detectAnomaliesBatch(
         amountCents: true,
         categoryId: true,
         anomalyFlags: true,
+        reviewReasons: true,
       },
     });
 
@@ -88,7 +105,7 @@ export async function detectAnomaliesBatch(
 
     const dupeMap = new Map<string, { id: number; description: string | null }[]>();
     for (const c of duplicateCandidates) {
-      const key = `${new Date(c.date).toISOString()}|${c.amountCents}`;
+      const key = `${utcDateKey(new Date(c.date))}|${c.amountCents}`;
       let bucket = dupeMap.get(key);
       if (!bucket) { bucket = []; dupeMap.set(key, bucket); }
       bucket.push({ id: c.id, description: c.description });
@@ -99,14 +116,15 @@ export async function detectAnomaliesBatch(
 
     for (const tx of transactions) {
       const flags: string[] = [];
+      const reasons: string[] = [];
 
       if (!tx.description || tx.description.trim().length === 0) {
         flags.push("incomplete");
+        reasons.push("Anomaly: missing description metadata.");
       }
 
-      const txDateISO = new Date(tx.date).toISOString();
       const normalizedDesc = normalize(tx.description);
-      const key = `${txDateISO}|${tx.amountCents}`;
+      const key = `${utcDateKey(new Date(tx.date))}|${tx.amountCents}`;
       const bucket = dupeMap.get(key);
       if (bucket) {
         const isDupe = bucket.some((m) => {
@@ -118,28 +136,49 @@ export async function detectAnomaliesBatch(
           }
           return false;
         });
-        if (isDupe) flags.push("possible_duplicate");
+        if (isDupe) {
+          flags.push("possible_duplicate");
+          reasons.push(
+            "Anomaly: possible duplicate with the same date, amount, and similar description."
+          );
+        }
       }
 
       const stats = statsMap.get(tx.categoryId ?? -1) ?? statsMap.get(-1);
       if (stats && stats.count >= 10 && stats.stddev > 0) {
         const zScore = Math.abs(tx.amountCents - stats.mean) / stats.stddev;
-        if (zScore > 3) flags.push("unusual_amount");
+        if (zScore > 3) {
+          flags.push("unusual_amount");
+          reasons.push(
+            `Anomaly: amount is ${zScore.toFixed(1)} standard deviations from the recent ${tx.categoryId === null ? "global" : "category"} average.`
+          );
+        }
       }
 
       const existingNonAnomaly = (tx.anomalyFlags || []).filter(
         (f) => !["incomplete", "possible_duplicate", "unusual_amount"].includes(f)
       );
+      const existingNonAnomalyReasons = (tx.reviewReasons || []).filter(
+        (reason: string) => !reason.startsWith("Anomaly:")
+      );
       const mergedFlags = [...new Set([...existingNonAnomaly, ...flags])];
+      const mergedReasons = [...new Set([...existingNonAnomalyReasons, ...reasons])];
       const needsReview = mergedFlags.length > 0 || tx.categoryId === null;
 
       const changed =
         mergedFlags.length !== (tx.anomalyFlags || []).length ||
-        mergedFlags.some((f) => !(tx.anomalyFlags || []).includes(f));
+        mergedFlags.some((f) => !(tx.anomalyFlags || []).includes(f)) ||
+        mergedReasons.length !== (tx.reviewReasons || []).length ||
+        mergedReasons.some((reason) => !(tx.reviewReasons || []).includes(reason));
 
       if (changed) {
         const sortedFlags = [...mergedFlags].sort();
-        const groupKey = JSON.stringify({ flags: sortedFlags, needsReview });
+        const sortedReasons = [...mergedReasons].sort();
+        const groupKey = JSON.stringify({
+          flags: sortedFlags,
+          reasons: sortedReasons,
+          needsReview,
+        });
         let ids = grouped.get(groupKey);
         if (!ids) { ids = []; grouped.set(groupKey, ids); }
         ids.push(tx.id);
@@ -149,13 +188,22 @@ export async function detectAnomaliesBatch(
 
     // Execute one UPDATE per unique flag combination (typically just a few)
     for (const [groupKey, ids] of grouped) {
-      const { flags: flagsArr, needsReview } = JSON.parse(groupKey) as { flags: string[]; needsReview: boolean };
+      const {
+        flags: flagsArr,
+        reasons: reasonsArr,
+        needsReview,
+      } = JSON.parse(groupKey) as {
+        flags: string[];
+        reasons: string[];
+        needsReview: boolean;
+      };
 
       for (let i = 0; i < ids.length; i += 1000) {
         const chunk = ids.slice(i, i + 1000);
         await prisma.$executeRaw`
           UPDATE transactions
           SET anomaly_flags = ${flagsArr}::text[],
+              review_reasons = ${reasonsArr}::text[],
               needs_review = ${needsReview}
           WHERE id = ANY(${chunk}::int[])
         `;
@@ -259,7 +307,7 @@ async function checkDuplicate(
 async function checkUnusualAmount(
   prisma: PrismaClient,
   tx: TransactionInput
-): Promise<boolean> {
+): Promise<{ flagged: boolean; zScore: number; scope: "global" | "category" }> {
   const where = tx.categoryId ? { categoryId: tx.categoryId } : {};
 
   const amounts = await prisma.transaction.findMany({
@@ -269,14 +317,30 @@ async function checkUnusualAmount(
     take: 1000,
   });
 
-  if (amounts.length < 10) return false;
+  if (amounts.length < 10) {
+    return { flagged: false, zScore: 0, scope: tx.categoryId ? "category" : "global" };
+  }
 
   const { mean, stddev } = computeStats(amounts.map((t) => t.amountCents));
-  if (stddev === 0) return false;
+  if (stddev === 0) {
+    return { flagged: false, zScore: 0, scope: tx.categoryId ? "category" : "global" };
+  }
 
-  return Math.abs(tx.amountCents - mean) / stddev > 3;
+  const zScore = Math.abs(tx.amountCents - mean) / stddev;
+  return {
+    flagged: zScore > 3,
+    zScore,
+    scope: tx.categoryId ? "category" : "global",
+  };
 }
 
 function normalize(s: string | null | undefined): string {
   return (s || "").trim().toLowerCase();
+}
+
+function utcDateKey(d: Date): string {
+  const year = d.getUTCFullYear();
+  const month = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }

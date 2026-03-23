@@ -89,7 +89,9 @@ export async function importCsv(
     description: string | null;
     amountCents: number;
     categoryId: number | null;
+    categorySource: "manual" | "import" | "rule";
     anomalyFlags: string[];
+    reviewReasons: string[];
     needsReview: boolean;
   }[] = [];
 
@@ -122,10 +124,12 @@ export async function importCsv(
 
     // Resolve category by slug or name
     let categoryId: number | null = null;
+    let categorySource: "manual" | "import" | "rule" = "manual";
     if (raw.category) {
       const cat = raw.category.trim().toLowerCase();
       const slug = cat.replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
       categoryId = categoryMap.get(slug) ?? categoryNameMap.get(cat) ?? null;
+      if (categoryId !== null) categorySource = "import";
     }
 
     // Check for duplicates within the file itself (Set-based O(1) lookup)
@@ -142,8 +146,11 @@ export async function importCsv(
     const ruleResult = await evaluateRules(
       prisma,
       { description, amountCents },
-      categoryId,
-      preloadedRules
+      {
+        existingCategoryId: categoryId,
+        existingCategorySource: categorySource,
+        preloadedRules,
+      }
     );
     const finalCategoryId = ruleResult.categoryId;
     const flags = ruleResult.flags;
@@ -153,7 +160,9 @@ export async function importCsv(
       description,
       amountCents,
       categoryId: finalCategoryId,
+      categorySource: ruleResult.categorySource,
       anomalyFlags: flags,
+      reviewReasons: ruleResult.reasons,
       needsReview: flags.length > 0 || !finalCategoryId || !description,
     });
   }
@@ -164,32 +173,26 @@ export async function importCsv(
   result.skipped += validRows.length - deduped.length;
   currentProgress!.skipped = result.skipped;
 
-  // Batch insert and collect IDs for anomaly detection
+  // Batch insert and collect exact IDs for anomaly detection.
   currentProgress!.phase = "inserting";
   const insertedIds: number[] = [];
   for (let i = 0; i < deduped.length; i += BATCH_SIZE) {
     const batch = deduped.slice(i, i + BATCH_SIZE);
-    const created = await prisma.transaction.createMany({ data: batch });
-    result.imported += created.count;
+    const created = await prisma.transaction.createManyAndReturn({
+      data: batch,
+      select: { id: true },
+    });
+    result.imported += created.length;
+    insertedIds.push(...created.map((row) => row.id));
     currentProgress!.imported = result.imported;
   }
 
-  // Fetch IDs of newly inserted transactions for anomaly detection
-  if (result.imported > 0) {
+  if (insertedIds.length > 0) {
     currentProgress!.phase = "detecting_anomalies";
-    const recent = await prisma.transaction.findMany({
-      orderBy: { id: "desc" },
-      take: result.imported,
-      select: { id: true },
-    });
-    insertedIds.push(...recent.map((r) => r.id));
-
-    // Run anomaly detection on the imported batch
     await detectAnomaliesBatch(prisma, insertedIds);
   }
 
   currentProgress!.phase = "complete";
-  const finalProgress = currentProgress;
   currentProgress = null;
   return result;
 }
@@ -201,7 +204,9 @@ async function deduplicateAgainstDb(
     description: string | null;
     amountCents: number;
     categoryId: number | null;
+    categorySource: "manual" | "import" | "rule";
     anomalyFlags: string[];
+    reviewReasons: string[];
     needsReview: boolean;
   }[]
 ): Promise<typeof rows> {
@@ -314,9 +319,9 @@ function parseCsv(buffer: Buffer): Promise<ParseResult> {
   });
 }
 
-function validateRow(
+export function validateRow(
   raw: RawRow,
-  rowNum: number
+  _rowNum: number
 ): { error?: string } {
   if (!raw.date || !raw.date.trim()) {
     return { error: `Missing date` };
@@ -356,10 +361,10 @@ function normalize(s: string | null | undefined): string {
   return (s || "").trim().toLowerCase();
 }
 
-/** Calendar date in the environment's local timezone (avoids UTC day shifts from toISOString). */
+/** Calendar date in UTC (consistent with how Prisma stores Date-only values as midnight UTC). */
 function dateKey(d: Date): string {
-  const year = d.getFullYear();
-  const month = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
+  const year = d.getUTCFullYear();
+  const month = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
 }
